@@ -471,6 +471,23 @@ impl LegacyRecovery {
         (time, epoch)
     }
 
+    fn expire_ack_loop_floor(&mut self, now: Instant) -> bool {
+        let expired = self.ack_latency_loss_floor &&
+            self.ack_loop_at.is_some_and(|at| {
+                now.saturating_duration_since(at) >= ACK_LOOP_WINDOW
+            });
+        if expired {
+            self.ack_loop_max = Duration::ZERO;
+            self.ack_loop_at = None;
+        }
+        expired
+    }
+
+    fn cap_timer_at_ack_loop_expiry(&self, timeout: Instant) -> Instant {
+        self.ack_loop_at
+            .map_or(timeout, |at| cmp::min(timeout, at + ACK_LOOP_WINDOW))
+    }
+
     fn pto_time_and_space(
         &self, handshake_status: HandshakeStatus, now: Instant,
     ) -> (Option<Instant>, Epoch) {
@@ -526,7 +543,8 @@ impl LegacyRecovery {
 
         if let Some(to) = earliest_loss_time {
             // Time threshold loss detection.
-            self.loss_timer.update(to);
+            self.loss_timer
+                .update(self.cap_timer_at_ack_loop_expiry(to));
             return;
         }
 
@@ -540,7 +558,8 @@ impl LegacyRecovery {
         // PTO timer.
         if let (Some(timeout), _) = self.pto_time_and_space(handshake_status, now)
         {
-            self.loss_timer.update(timeout);
+            self.loss_timer
+                .update(self.cap_timer_at_ack_loop_expiry(timeout));
         } else {
             self.loss_timer.clear();
         }
@@ -549,6 +568,7 @@ impl LegacyRecovery {
     fn detect_lost_packets(
         &mut self, epoch: Epoch, now: Instant, trace_id: &str,
     ) -> (usize, usize) {
+        self.expire_ack_loop_floor(now);
         let mut loss_delay = cmp::max(self.rtt_stats.latest_rtt, self.rtt())
             .mul_f64(self.time_thresh);
         if self.ack_latency_loss_floor {
@@ -741,7 +761,7 @@ impl RecoveryOps for LegacyRecovery {
                 .max()
                 .unwrap_or(Duration::ZERO);
             let expired = self.ack_loop_at.is_none_or(|at| {
-                now.saturating_duration_since(at) > ACK_LOOP_WINDOW
+                now.saturating_duration_since(at) >= ACK_LOOP_WINDOW
             });
             if expired || batch_loop >= self.ack_loop_max {
                 self.ack_loop_max = batch_loop;
@@ -805,6 +825,7 @@ impl RecoveryOps for LegacyRecovery {
         &mut self, handshake_status: HandshakeStatus, now: Instant,
         trace_id: &str,
     ) -> OnLossDetectionTimeoutOutcome {
+        let ack_loop_expired = self.expire_ack_loop_floor(now);
         let (earliest_loss_time, epoch) = self.loss_time_and_space();
 
         if earliest_loss_time.is_some() {
@@ -819,6 +840,11 @@ impl RecoveryOps for LegacyRecovery {
                 lost_packets,
                 lost_bytes,
             };
+        }
+
+        if ack_loop_expired {
+            self.set_loss_detection_timer(handshake_status, now);
+            return OnLossDetectionTimeoutOutcome::default();
         }
 
         let epoch = if self.bytes_in_flight.get() > 0 {

@@ -991,7 +991,11 @@ impl RecoveryOps for GRecovery {
             };
         }
 
-        if ack_loop_expired {
+        if ack_loop_expired &&
+            self.pto_time_and_space(handshake_status, now)
+                .0
+                .is_none_or(|timeout| timeout > now)
+        {
             self.set_loss_detection_timer(handshake_status, now);
             return OnLossDetectionTimeoutOutcome::default();
         }

@@ -1746,6 +1746,70 @@ mod tests {
         assert_eq!(r.lost_count(), 1);
     }
 
+    #[rstest]
+    fn an_overdue_pto_is_not_skipped_when_the_ack_latency_floor_expires(
+        #[values("reno", "cubic", "bbr2", "bbr2_gcongestion")]
+        cc_algorithm_name: &str,
+    ) {
+        let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        assert_eq!(cfg.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
+        cfg.set_enable_ack_latency_loss_floor(true);
+
+        let mut r = Recovery::new(&cfg);
+        let mut now = Instant::now();
+
+        let p = test_utils::helper_packet_sent(0, now, 1000);
+        r.on_packet_sent(
+            p,
+            packet::Epoch::Application,
+            HandshakeStatus::default(),
+            now,
+            "",
+        );
+
+        now += Duration::from_secs(2);
+        for i in 1..3 {
+            let p = test_utils::helper_packet_sent(i, now, 1000);
+            r.on_packet_sent(
+                p,
+                packet::Epoch::Application,
+                HandshakeStatus::default(),
+                now,
+                "",
+            );
+        }
+        now += Duration::from_millis(4);
+
+        // The old and fresh acknowledgements establish the floor while the
+        // higher-numbered tail packet remains outstanding, so there is no
+        // time-threshold loss to handle before its PTO.
+        let mut acked = RangeSet::default();
+        acked.insert(0..2);
+        assert_eq!(
+            r.on_ack_received(
+                &acked,
+                25,
+                packet::Epoch::Application,
+                HandshakeStatus::default(),
+                now,
+                None,
+                "",
+            )
+            .unwrap()
+            .lost_packets,
+            0
+        );
+
+        now += ACK_LOOP_WINDOW + Duration::from_secs(1);
+        assert_eq!(
+            r.on_loss_detection_timeout(HandshakeStatus::default(), now, "",)
+                .lost_packets,
+            0
+        );
+        assert_eq!(r.pto_count(), 1);
+        assert_eq!(r.loss_probes(packet::Epoch::Application), 1);
+    }
+
     // TODO: This should run agains both `congestion` and `gcongestion`.
     // `congestion` and `gcongestion` behave differently. That might be ok
     // given the different algorithms but it would be ideal to merge and share

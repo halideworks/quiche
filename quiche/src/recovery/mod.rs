@@ -1810,6 +1810,70 @@ mod tests {
         assert_eq!(r.loss_probes(packet::Epoch::Application), 1);
     }
 
+    #[rstest]
+    fn ack_floor_expiry_does_not_delay_an_anti_deadlock_pto(
+        #[values("reno", "cubic", "bbr2", "bbr2_gcongestion")]
+        cc_algorithm_name: &str,
+    ) {
+        let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        assert_eq!(cfg.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
+        cfg.set_enable_ack_latency_loss_floor(true);
+
+        let mut r = Recovery::new(&cfg);
+        let mut now = Instant::now();
+        let handshake_status = HandshakeStatus {
+            peer_verified_address: false,
+            ..HandshakeStatus::default()
+        };
+
+        let p = test_utils::helper_packet_sent(0, now, 1000);
+        r.on_packet_sent(
+            p,
+            packet::Epoch::Application,
+            handshake_status,
+            now,
+            "",
+        );
+
+        now += Duration::from_secs(2);
+        let p = test_utils::helper_packet_sent(1, now, 1000);
+        r.on_packet_sent(
+            p,
+            packet::Epoch::Application,
+            handshake_status,
+            now,
+            "",
+        );
+        now += Duration::from_millis(4);
+
+        let mut acked = RangeSet::default();
+        acked.insert(0..2);
+        assert_eq!(
+            r.on_ack_received(
+                &acked,
+                25,
+                packet::Epoch::Application,
+                handshake_status,
+                now,
+                None,
+                "",
+            )
+            .unwrap()
+            .acked_bytes,
+            2000
+        );
+        assert_eq!(r.bytes_in_flight(), 0);
+
+        // With no bytes in flight, this is the anti-deadlock PTO. The ACK
+        // floor must neither pull it earlier nor suppress a late callback.
+        let timer = r.loss_detection_timer().unwrap();
+        assert_eq!(timer, now + r.pto());
+        now = timer + ACK_LOOP_WINDOW;
+        r.on_loss_detection_timeout(handshake_status, now, "");
+        assert_eq!(r.pto_count(), 1);
+        assert_eq!(r.loss_probes(packet::Epoch::Handshake), 1);
+    }
+
     // TODO: This should run agains both `congestion` and `gcongestion`.
     // `congestion` and `gcongestion` behave differently. That might be ok
     // given the different algorithms but it would be ideal to merge and share

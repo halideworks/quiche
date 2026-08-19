@@ -558,8 +558,11 @@ impl LegacyRecovery {
         // PTO timer.
         if let (Some(timeout), _) = self.pto_time_and_space(handshake_status, now)
         {
-            self.loss_timer
-                .update(self.cap_timer_at_ack_loop_expiry(timeout));
+            self.loss_timer.update(if self.bytes_in_flight.is_zero() {
+                timeout
+            } else {
+                self.cap_timer_at_ack_loop_expiry(timeout)
+            });
         } else {
             self.loss_timer.clear();
         }
@@ -843,6 +846,7 @@ impl RecoveryOps for LegacyRecovery {
         }
 
         if ack_loop_expired &&
+            !self.bytes_in_flight.is_zero() &&
             self.pto_time_and_space(handshake_status, now)
                 .0
                 .is_none_or(|timeout| timeout > now)

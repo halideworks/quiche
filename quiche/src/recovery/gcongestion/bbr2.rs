@@ -837,6 +837,8 @@ impl CongestionControl for BBRv2 {
 mod tests {
     use rstest::rstest;
 
+    use super::drain::Drain;
+    use super::mode::Cycle;
     use super::*;
 
     #[rstest]
@@ -886,6 +888,122 @@ mod tests {
         assert_eq!(
             bbr2.pacing_rate.to_bytes_per_period(initial_rtt),
             (2.88499 * pacing_cwnd as f64) as u64
+        );
+    }
+
+    #[rstest]
+    fn unpaced_probe_up_ignores_inflight_hi(#[values(false, true)] pacing: bool) {
+        let bbr2 =
+            BBRv2::new(10, 10000, 1200, Duration::from_millis(333), pacing, None);
+
+        assert_eq!(bbr2.params.pacing, pacing);
+        assert_eq!(bbr2.params.probe_up_ignore_inflight_hi, !pacing);
+    }
+
+    /// A model whose `max_ack_height` is non-zero, which is the term the
+    /// unpaced drain target adds to `bdp0`. The tracker starts a fresh
+    /// aggregation epoch whenever a packet sent after the epoch began is
+    /// acknowledged, and reports nothing for that epoch, so the burst is sent
+    /// once and acknowledged in two halves.
+    fn model_with_ack_height(params: &Params) -> BBRv2NetworkModel {
+        const PACKET: usize = 1200;
+        const PACKETS: u64 = 20;
+        const IN_FLIGHT: usize = PACKETS as usize * PACKET;
+
+        let start = Instant::now();
+        let mut model = BBRv2NetworkModel::new(params, Duration::from_millis(50));
+        for pkt_num in 0..PACKETS {
+            model.on_packet_sent(
+                start,
+                pkt_num as usize * PACKET,
+                pkt_num,
+                PACKET,
+                true,
+            );
+        }
+
+        let ack = |model: &mut BBRv2NetworkModel,
+                   first: u64,
+                   last: u64,
+                   at: Duration| {
+            let acked: Vec<Acked> = (first..last)
+                .map(|pkt_num| Acked {
+                    pkt_num,
+                    time_sent: start,
+                })
+                .collect();
+            let mut event = BBRv2CongestionEvent::new(
+                start + at,
+                IN_FLIGHT,
+                IN_FLIGHT,
+                false,
+            );
+            model.on_congestion_event_start(&acked, &[], &mut event, params);
+        };
+
+        ack(&mut model, 0, PACKETS / 2, Duration::from_millis(50));
+        ack(&mut model, PACKETS / 2, PACKETS, Duration::from_millis(51));
+
+        model
+    }
+
+    fn drain_one_event(
+        model: BBRv2NetworkModel, params: &Params, bytes_in_flight: usize,
+    ) -> Mode {
+        let now = Instant::now();
+        let mut event = BBRv2CongestionEvent::new(
+            now,
+            bytes_in_flight,
+            bytes_in_flight,
+            false,
+        );
+        event.bytes_in_flight = bytes_in_flight;
+        let mut recovery_stats = RecoveryStats::default();
+
+        Drain {
+            model,
+            cycle: Cycle::default(),
+        }
+        .on_congestion_event(
+            bytes_in_flight,
+            now,
+            &[],
+            &[],
+            &mut event,
+            0,
+            params,
+            &mut recovery_stats,
+            0,
+        )
+    }
+
+    #[rstest]
+    fn drain_exits_on_its_own_target(#[values(false, true)] pacing: bool) {
+        let mut params = DEFAULT_PARAMS;
+        params.pacing = pacing;
+
+        let ack_height = model_with_ack_height(&params).max_ack_height();
+        let bdp0 = model_with_ack_height(&params).bdp0();
+        assert!(ack_height > 0, "the test needs a non-zero max_ack_height");
+        assert!(bdp0 > 0, "the test needs a non-zero bdp0");
+
+        // Paced, the exit target is `bdp0`. Unpaced it also allows the ack
+        // height that the drained window settles above `bdp0` by.
+        let target = if pacing { bdp0 } else { bdp0 + ack_height };
+
+        assert!(matches!(
+            drain_one_event(model_with_ack_height(&params), &params, target),
+            Mode::ProbeBW(_)
+        ));
+
+        let above =
+            drain_one_event(model_with_ack_height(&params), &params, target + 1);
+        let Mode::Drain(drain) = above else {
+            panic!("left DRAIN above its own target");
+        };
+        assert_eq!(
+            drain.model.cwnd_gain(),
+            if pacing { params.drain_cwnd_gain } else { 1.0 }
         );
     }
 }

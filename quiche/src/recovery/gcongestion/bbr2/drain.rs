@@ -67,10 +67,24 @@ impl ModeImpl for Drain {
     ) -> Mode {
         self.model.set_pacing_gain(params.drain_pacing_gain);
         // Only STARTUP can transition to DRAIN, both of them use the same cwnd
-        // gain.
-        self.model.set_cwnd_gain(params.drain_cwnd_gain);
+        // gain, unless there is no pacer to apply `drain_pacing_gain`: then
+        // the congestion window is the only thing setting bytes in flight,
+        // and at a gain of 2.0 it holds them at twice the target the exit
+        // test below asks for, so DRAIN never ends. Drain with the window
+        // instead.
+        self.model.set_cwnd_gain(if params.pacing {
+            params.drain_cwnd_gain
+        } else {
+            1.0
+        });
 
-        let drain_target = self.drain_target();
+        let mut drain_target = self.drain_target();
+        if !params.pacing {
+            // `update_congestion_window` adds `max_ack_height` on top of the
+            // gain's BDP once full bandwidth is reached, so a window drained
+            // to one BDP still settles that much above the target.
+            drain_target += self.model.max_ack_height();
+        }
         if congestion_event.bytes_in_flight <= drain_target {
             return self.into_probe_bw(
                 event_time,

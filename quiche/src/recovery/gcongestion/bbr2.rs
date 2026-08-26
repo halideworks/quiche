@@ -60,6 +60,11 @@ const MAX_MODE_CHANGES_PER_CONGESTION_EVENT: usize = 4;
 
 #[derive(Debug)]
 struct Params {
+    /// Whether the pacer is applying this sender's release times. With it
+    /// off the pacing gains are inert and the congestion window is the only
+    /// actuator, which changes what DRAIN and PROBE_UP can do.
+    pacing: bool,
+
     // STARTUP parameters.
     /// The gain for CWND in startup.
     startup_cwnd_gain: f32,
@@ -274,6 +279,8 @@ impl Params {
 }
 
 const DEFAULT_PARAMS: Params = Params {
+    pacing: true,
+
     startup_cwnd_gain: 2.0,
 
     startup_pacing_gain: 2.773,
@@ -513,16 +520,26 @@ impl BBRv2CongestionEvent {
 impl BBRv2 {
     pub fn new(
         initial_congestion_window: usize, max_congestion_window: usize,
-        max_segment_size: usize, smoothed_rtt: Duration,
+        max_segment_size: usize, smoothed_rtt: Duration, pacing: bool,
         custom_bbr_params: Option<&BbrParams>,
     ) -> Self {
         let cwnd = initial_congestion_window * max_segment_size;
 
-        let params = if let Some(custom_bbr_settings) = custom_bbr_params {
+        let mut params = if let Some(custom_bbr_settings) = custom_bbr_params {
             DEFAULT_PARAMS.with_overrides(custom_bbr_settings)
         } else {
             DEFAULT_PARAMS
         };
+        params.pacing = pacing;
+
+        if !pacing {
+            // PROBE_UP's 1.25 pacing gain is inert without a pacer, so the
+            // congestion window is the only way to probe, and `inflight_hi`
+            // caps it at whatever the last loss episode set. Bound PROBE_UP
+            // by `inflight_lo` alone, which PROBE_REFILL has just cleared,
+            // so the probe can actually climb.
+            params.probe_up_ignore_inflight_hi = true;
+        }
 
         BBRv2 {
             mode: Mode::startup(BBRv2NetworkModel::new(&params, smoothed_rtt)),
@@ -844,6 +861,7 @@ mod tests {
             MAX_WINDOW_PACKETS,
             INIT_PACKET_SIZE,
             initial_rtt,
+            true,
             Some(bbr_params),
         );
 

@@ -124,7 +124,7 @@ jobs:
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.RUSTTOOLCHAIN }}
+          toolchain: nightly-2026-08-11
           components: rustfmt
 
       - name: Run cargo fmt - quiche

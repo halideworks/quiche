@@ -8833,6 +8833,63 @@ fn app_close_by_client(
 }
 
 #[rstest]
+fn app_close_with_pending_handshake_probe(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    #[values(false, true)] close_server: bool,
+) {
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+    assert!(pipe.client.is_established() && pipe.server.is_established());
+    assert!(!pipe.client.handshake_confirmed);
+
+    let (conn, peer) = if close_server {
+        (&mut pipe.server, &mut pipe.client)
+    } else {
+        (&mut pipe.client, &mut pipe.server)
+    };
+    conn.paths
+        .get_active_mut()
+        .unwrap()
+        .recovery
+        .inc_loss_probes(packet::Epoch::Handshake);
+    conn.close(true, 123, b"closing").unwrap();
+    let mut buf = [0; 1200];
+    for _ in 0..4 {
+        match conn.send(&mut buf) {
+            Ok((len, info)) => {
+                peer.recv(&mut buf[..len], RecvInfo {
+                    from: info.from,
+                    to: info.to,
+                })
+                .unwrap();
+            },
+            Err(Error::Done) => (),
+            Err(error) => panic!("close send failed: {error:?}"),
+        }
+        if conn.is_draining() {
+            break;
+        }
+    }
+    assert!(
+        conn.is_draining(),
+        "handshake probe prevented application close"
+    );
+    assert_eq!(
+        peer.peer_error(),
+        Some(&ConnectionError {
+            is_app: true,
+            error_code: 123,
+            reason: b"closing".to_vec(),
+        })
+    );
+}
+
+#[rstest]
 fn app_close_by_server_during_handshake_private_key_failure(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
 ) {

@@ -8234,8 +8234,17 @@ impl<F: BufFactory> Connection<F> {
                 continue;
             }
 
-            // We are ready to send data for this packet number space.
-            if crypto_ctx.data_available() || pkt_space.ready() {
+            if pkt_space.ready() {
+                return Ok(Type::from_epoch(epoch));
+            }
+
+            // Pending recovery cannot send CRYPTO or PING while closing.
+            // Preserve a queued ACK, then let the application close through.
+            if self.local_error.is_some() && self.is_established() {
+                continue;
+            }
+
+            if crypto_ctx.data_available() {
                 return Ok(Type::from_epoch(epoch));
             }
 
